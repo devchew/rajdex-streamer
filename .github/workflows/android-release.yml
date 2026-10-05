@@ -1,0 +1,66 @@
+name: Android Release APK
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' ||
+          (github.event_name == 'pull_request' &&
+           github.event.pull_request.merged == true &&
+           github.event.pull_request.base.ref == 'master') }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Build release APK
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleRelease
+
+      - name: Collect release APK files
+        id: apks
+        run: |
+          mapfile -t apk_files < <(find app/build/outputs/apk/release -type f -name '*.apk' | sort)
+          if [ ${#apk_files[@]} -eq 0 ]; then
+            echo "No release APK files found in app/build/outputs/apk/release" >&2
+            exit 1
+          fi
+
+          {
+            echo 'files<<EOF'
+            printf '%s\n' "${apk_files[@]}"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Release APK files:"
+          printf '%s\n' "${apk_files[@]}"
+
+      - name: Create GitHub Release and upload APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}.${{ github.run_attempt }}
+          name: Android Release v1.0.${{ github.run_number }}.${{ github.run_attempt }}
+          generate_release_notes: true
+          files: ${{ steps.apks.outputs.files }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
