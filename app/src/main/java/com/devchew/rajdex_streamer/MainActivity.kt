@@ -26,6 +26,7 @@ import android.view.ViewGroup
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
@@ -60,6 +61,7 @@ class MainActivity : AppCompatActivity() {
     private val rawPermissionPending = mutableSetOf<Int>()
     private val libraryPermissionPending = mutableSetOf<Int>()
     private lateinit var recordingButton: Button
+    private lateinit var audioRecordingCheckbox: CheckBox
     private var recordingRequested = false
     private var recordingActive = false
     private var audioRecorder: UsbWavRecorder? = null
@@ -85,7 +87,10 @@ class MainActivity : AppCompatActivity() {
         var options: List<ResolutionOption> = emptyList()
         var selectedOption: ResolutionOption? = null
         var changingOptions = false
+        lateinit var recordingCheckbox: CheckBox
+        lateinit var encodeMjpegCheckbox: CheckBox
         var recordingWriter: MjpegAviRecorder? = null
+        var mp4RecordingWriter: MjpegMp4Recorder? = null
         var recordingFile: File? = null
     }
 
@@ -152,8 +157,15 @@ class MainActivity : AppCompatActivity() {
         }
         root.addView(globalStatus)
 
+        audioRecordingCheckbox = CheckBox(this).apply {
+            text = "Nagrywaj dźwięk USB"
+            setTextColor(Color.WHITE)
+            isChecked = true
+        }
+        root.addView(audioRecordingCheckbox)
+
         recordingButton = Button(this).apply {
-            text = "NAGRAJ OBIE KAMERY"
+            text = "NAGRAJ ZAZNACZONE"
             isEnabled = false
             setOnClickListener {
                 if (recordingRequested) stopRecordingAndRestorePreview()
@@ -167,6 +179,7 @@ class MainActivity : AppCompatActivity() {
         val scroll = ScrollView(this)
         val panelList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         slots.forEach { slot -> panelList.addView(createSlotView(slot)) }
+        refreshRecordingControls()
         scroll.addView(panelList)
         root.addView(scroll, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
@@ -198,6 +211,24 @@ class MainActivity : AppCompatActivity() {
             setPadding(2, 2, 2, 2)
         }
         card.addView(slot.title)
+
+        val recordingOptions = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        slot.recordingCheckbox = CheckBox(this).apply {
+            text = "Nagrywaj tę kamerę"
+            setTextColor(Color.WHITE)
+            isChecked = true
+            setOnCheckedChangeListener { _, _ -> refreshRecordingControls() }
+        }
+        recordingOptions.addView(slot.recordingCheckbox)
+        slot.encodeMjpegCheckbox = CheckBox(this).apply {
+            text = "Koduj MJPEG do MP4 (H.264)"
+            setTextColor(Color.WHITE)
+            isChecked = false
+            visibility = View.GONE
+            setOnCheckedChangeListener { _, _ -> refreshRecordingControls() }
+        }
+        recordingOptions.addView(slot.encodeMjpegCheckbox)
+        card.addView(recordingOptions)
 
         slot.resolution = Spinner(this).apply {
             isEnabled = false
@@ -308,6 +339,7 @@ class MainActivity : AppCompatActivity() {
         slotByDeviceId[device.deviceId] = slot
         slot.raw = hasBulkEndpoint(device)
         slot.title.text = "KAMERA USB ${slot.index + 1}: ${device.productName ?: "UVC"}"
+        refreshRecordingControls(slot)
         updateGlobalStatus()
         slot.texture.visibility = if (slot.raw) View.GONE else View.VISIBLE
         slot.image.visibility = if (slot.raw) View.VISIBLE else View.GONE
@@ -325,10 +357,23 @@ class MainActivity : AppCompatActivity() {
         rawPermissionPending.remove(device.deviceId)
         libraryPermissionPending.remove(device.deviceId)
         stopRaw(slot)
+        slot.mp4RecordingWriter?.let { writer ->
+            slot.mp4RecordingWriter = null
+            val file = slot.recordingFile
+            slot.recordingFile = null
+            Thread({
+                if (runCatching { writer.close() }.isSuccess && file != null) {
+                    publishRecordingAsync(file, "video/mp4") {
+                        setSlotStatus(slot, "Zapisano MP4: DCIM/Rajdex/${file.name}")
+                    }
+                } else file?.delete()
+            }, "MP4-detach-finalize").start()
+        }
         stopLibraryCamera(slot)
         slot.libraryControlBlock = null
         slot.device = null
         slot.raw = false
+        refreshRecordingControls(slot)
         slot.options = emptyList()
         slot.selectedOption = null
         slot.resolution.adapter = null
@@ -540,8 +585,13 @@ class MainActivity : AppCompatActivity() {
                         runOnUiThread { failRecording("Blad zapisu AVI: ${error.message ?: "plik"}") }
                     }
                 }
+                slot.mp4RecordingWriter?.let { writer ->
+                    runCatching { writer.writeFrame(data) }.onFailure { error ->
+                        runOnUiThread { failRecording("Blad kodowania MP4: ${error.message ?: "encoder"}") }
+                    }
+                }
                 val nowMs = android.os.SystemClock.elapsedRealtime()
-                if (slot.recordingWriter != null && nowMs - lastPreviewUpdateMs < 66L) continue
+                if ((slot.recordingWriter != null || slot.mp4RecordingWriter != null) && nowMs - lastPreviewUpdateMs < 66L) continue
                 lastPreviewUpdateMs = nowMs
                 val bitmap = BitmapFactory.decodeByteArray(data, 0, data.size)
                 if (bitmap != null) {
@@ -692,13 +742,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun requestOrStartRecording() {
-        if (slots.any { it.device == null }) {
-            globalStatus.text = "Do nagrywania podlacz dwie kamery USB"
+        val selectedSlots = slots.filter { it.device != null && it.recordingCheckbox.isChecked }
+        if (selectedSlots.isEmpty()) {
+            globalStatus.text = "Zaznacz co najmniej jedną podłączoną kamerę"
             return
         }
-        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+        if (audioRecordingCheckbox.isChecked && checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), REQUEST_AUDIO_PERMISSION)
-            globalStatus.text = "Zezwol na dostep do audio USB"
+            globalStatus.text = "Zezwól na dostęp do audio USB"
             return
         }
         startRecording()
@@ -711,35 +762,50 @@ class MainActivity : AppCompatActivity() {
             globalStatus.text = "Nie mozna utworzyc katalogu nagran"
             return
         }
-        val audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
-        val audioInput = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS).firstOrNull {
-            it.type == AudioDeviceInfo.TYPE_USB_DEVICE && it.productName.toString().contains("UGREEN", true)
-        }
-        if (audioInput == null) {
-            globalStatus.text = "Nie wykryto wejscia audio USB grabbera UGREEN"
+        val selectedSlots = slots.filter { it.device != null && it.recordingCheckbox.isChecked }
+        if (selectedSlots.isEmpty()) {
+            globalStatus.text = "Zaznacz co najmniej jedną podłączoną kamerę"
             return
         }
+        val audioInput = if (audioRecordingCheckbox.isChecked) {
+            val audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
+            audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS).firstOrNull {
+                it.type == AudioDeviceInfo.TYPE_USB_DEVICE && it.productName.toString().contains("UGREEN", true)
+            }.also {
+                if (it == null) globalStatus.text = "Nie wykryto wejścia audio USB UGREEN"
+            } ?: return
+        } else null
         val stamp = java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US).format(java.util.Date())
         try {
-            val audioFile = File(directory, "${stamp}_audio_UGREEN.wav")
-            audioRecorder = UsbWavRecorder.create(audioFile, audioInput).also { it.start() }
+            audioInput?.let {
+                val audioFile = File(directory, "${stamp}_audio_UGREEN.wav")
+                audioRecorder = UsbWavRecorder.create(audioFile, it).also { recorder -> recorder.start() }
+            }
             recordingRequested = true
             recordingActive = true
             recordingButton.text = "ZATRZYMAJ NAGRYWANIE"
-            recordingButton.isEnabled = true
+            refreshRecordingControls()
 
-            slots.forEach { slot ->
-                val device = slot.device ?: error("Brak kamery USB ${slot.index + 1}")
+            selectedSlots.forEach { slot ->
+                val device = requireNotNull(slot.device)
                 val safeName = (device.productName ?: "USB_camera_${slot.index + 1}")
                     .replace(Regex("[^A-Za-z0-9_-]"), "_")
                 if (slot.raw) {
                     val mode = slot.selectedOption ?: error("Brak rozdzielczosci dla ${device.productName}")
-                    slot.recordingFile = File(directory, "${stamp}_${slot.index + 1}_${safeName}.avi")
-                    slot.recordingWriter = MjpegAviRecorder(
-                        slot.recordingFile!!,
-                        mode.width, mode.height, mode.fps.coerceAtLeast(1)
-                    )
-                    setSlotStatus(slot, "Nagrywam MJPEG ${mode.width}x${mode.height}")
+                    if (slot.encodeMjpegCheckbox.isChecked) {
+                        slot.recordingFile = File(directory, "${stamp}_${slot.index + 1}_${safeName}.mp4")
+                        slot.mp4RecordingWriter = MjpegMp4Recorder(
+                            slot.recordingFile!!, mode.width, mode.height, 30
+                        )
+                        setSlotStatus(slot, "Nagrywam MP4 H.264 ${mode.width}x${mode.height}")
+                    } else {
+                        slot.recordingFile = File(directory, "${stamp}_${slot.index + 1}_${safeName}.avi")
+                        slot.recordingWriter = MjpegAviRecorder(
+                            slot.recordingFile!!,
+                            mode.width, mode.height, mode.fps.coerceAtLeast(1)
+                        )
+                        setSlotStatus(slot, "Nagrywam MJPEG ${mode.width}x${mode.height}")
+                    }
                 } else {
                     val camera = slot.libraryCamera ?: error("Kamera ${slot.index + 1} nie jest gotowa")
                     val path = File(directory, "${stamp}_${slot.index + 1}_${safeName}").absolutePath
@@ -759,7 +825,11 @@ class MainActivity : AppCompatActivity() {
                     }, path)
                 }
             }
-            globalStatus.text = "Nagrywanie obu kamer i audio USB"
+            val tracks = buildList {
+                if (selectedSlots.isNotEmpty()) add("${selectedSlots.size} kamer")
+                if (audioRecorder != null) add("audio USB")
+            }
+            globalStatus.text = "Nagrywanie: ${tracks.joinToString(" + ")}"
         } catch (error: Exception) {
             failRecording("Nie mozna uruchomic nagrywania: ${error.message ?: error.javaClass.simpleName}")
         }
@@ -769,8 +839,24 @@ class MainActivity : AppCompatActivity() {
         if (!recordingRequested) return
         recordingRequested = false
         recordingActive = false
-        recordingButton.text = "NAGRAJ OBIE KAMERY"
+        recordingButton.text = "NAGRAJ ZAZNACZONE"
         slots.forEach { slot ->
+            slot.mp4RecordingWriter?.let { writer ->
+                slot.mp4RecordingWriter = null
+                val recordingFile = slot.recordingFile
+                slot.recordingFile = null
+                Thread({
+                    val saved = runCatching { writer.close() }.isSuccess
+                    if (saved && recordingFile != null) {
+                        publishRecordingAsync(recordingFile, "video/mp4") {
+                            setSlotStatus(slot, "Zapisano MP4: DCIM/Rajdex/${recordingFile.name}")
+                        }
+                    } else {
+                        recordingFile?.delete()
+                        runOnUiThread { setSlotStatus(slot, "Brak klatek MP4 — plik nie został zapisany") }
+                    }
+                }, "MP4-finalize").start()
+            }
             slot.recordingWriter?.let { writer ->
                 slot.recordingWriter = null
                 val recordingFile = slot.recordingFile
@@ -807,6 +893,7 @@ class MainActivity : AppCompatActivity() {
                 }
             }, "USB-audio-finalize").start()
         }
+        refreshRecordingControls()
         updateGlobalStatus()
     }
 
@@ -834,13 +921,31 @@ class MainActivity : AppCompatActivity() {
     private fun updateGlobalStatus() {
         if (!::globalStatus.isInitialized) return
         val count = slotByDeviceId.size
-        if (::recordingButton.isInitialized) {
-            recordingButton.isEnabled = recordingRequested || count == slots.size
-        }
+        refreshRecordingControls()
         globalStatus.text = when (count) {
             0 -> "Podłącz jedną lub dwie kamery UVC przez USB"
             1 -> "1 kamera UVC połączona · druga może zostać podłączona"
             else -> "Obie kamery UVC są połączone"
+        }
+    }
+
+    private fun refreshRecordingControls(slot: PreviewSlot? = null) {
+        if (!::slots.isInitialized) return
+        val targets = slot?.let(::listOf) ?: slots
+        targets.forEach { preview ->
+            if (recordingRequested) {
+                preview.recordingCheckbox.isEnabled = false
+                preview.encodeMjpegCheckbox.isEnabled = false
+            } else {
+                preview.recordingCheckbox.isEnabled = preview.device != null
+                preview.encodeMjpegCheckbox.visibility = if (preview.raw) View.VISIBLE else View.GONE
+                preview.encodeMjpegCheckbox.isEnabled = preview.raw && preview.device != null
+            }
+        }
+        if (::audioRecordingCheckbox.isInitialized) audioRecordingCheckbox.isEnabled = !recordingRequested
+        if (::recordingButton.isInitialized) {
+            val hasSelection = slots.any { it.device != null && it.recordingCheckbox.isChecked }
+            recordingButton.isEnabled = recordingRequested || hasSelection
         }
     }
 
@@ -946,6 +1051,7 @@ class MainActivity : AppCompatActivity() {
         audioRecorder = null
         slots.forEach { slot ->
             slot.recordingWriter?.let { runCatching { it.close() }; slot.recordingWriter = null }
+            slot.mp4RecordingWriter?.let { runCatching { it.close() }; slot.mp4RecordingWriter = null }
             slot.libraryCamera?.let { camera ->
                 if (camera.isRecording()) camera.captureVideoStop()
             }
