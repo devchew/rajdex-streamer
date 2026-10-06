@@ -2,6 +2,8 @@ package com.devchew.rajdex_streamer
 
 import android.Manifest
 import android.app.PendingIntent
+import android.media.AudioDeviceInfo
+import android.media.AudioManager
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -17,11 +19,13 @@ import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.view.TextureView
 import android.view.View
 import android.view.ViewGroup
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
+import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
@@ -33,6 +37,7 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import com.jiangdg.ausbc.MultiCameraClient
 import com.jiangdg.ausbc.callback.ICameraStateCallBack
+import com.jiangdg.ausbc.callback.ICaptureCallBack
 import com.jiangdg.ausbc.callback.IDeviceConnectCallBack
 import com.jiangdg.ausbc.camera.CameraUVC
 import com.jiangdg.ausbc.camera.bean.CameraRequest
@@ -40,6 +45,7 @@ import com.jiangdg.ausbc.camera.bean.PreviewSize
 import com.jiangdg.ausbc.widget.AspectRatioTextureView
 import com.jiangdg.usb.USBMonitor
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.Executors
@@ -53,6 +59,10 @@ class MainActivity : AppCompatActivity() {
     private val slotByDeviceId = mutableMapOf<Int, PreviewSlot>()
     private val rawPermissionPending = mutableSetOf<Int>()
     private val libraryPermissionPending = mutableSetOf<Int>()
+    private lateinit var recordingButton: Button
+    private var recordingRequested = false
+    private var recordingActive = false
+    private var audioRecorder: UsbWavRecorder? = null
     private val rawPermissionAction by lazy { "$packageName.RAW_USB_PERMISSION" }
 
     private inner class PreviewSlot(val index: Int) {
@@ -75,6 +85,8 @@ class MainActivity : AppCompatActivity() {
         var options: List<ResolutionOption> = emptyList()
         var selectedOption: ResolutionOption? = null
         var changingOptions = false
+        var recordingWriter: MjpegAviRecorder? = null
+        var recordingFile: File? = null
     }
 
     private data class ResolutionOption(
@@ -139,6 +151,18 @@ class MainActivity : AppCompatActivity() {
             setPadding(4, 0, 4, 6)
         }
         root.addView(globalStatus)
+
+        recordingButton = Button(this).apply {
+            text = "NAGRAJ OBIE KAMERY"
+            isEnabled = false
+            setOnClickListener {
+                if (recordingRequested) stopRecordingAndRestorePreview()
+                else requestOrStartRecording()
+            }
+        }
+        root.addView(recordingButton, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ))
 
         val scroll = ScrollView(this)
         val panelList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
@@ -244,8 +268,8 @@ class MainActivity : AppCompatActivity() {
                 if (device == null || ctrlBlock == null) return
                 libraryPermissionPending.remove(device.deviceId)
                 val slot = slotByDeviceId[device.deviceId] ?: return
-                if (hasBulkEndpoint(device)) return
                 slot.libraryControlBlock = ctrlBlock
+                if (hasBulkEndpoint(device)) return
                 val selected = slot.selectedOption
                 openLibraryCamera(
                     slot, device, ctrlBlock,
@@ -297,6 +321,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun handleDetach(device: UsbDevice) {
         val slot = slotByDeviceId.remove(device.deviceId) ?: return
+        slot.recordingWriter?.let { runCatching { it.close() }; slot.recordingWriter = null }
         rawPermissionPending.remove(device.deviceId)
         libraryPermissionPending.remove(device.deviceId)
         stopRaw(slot)
@@ -482,6 +507,7 @@ class MainActivity : AppCompatActivity() {
         var frameId = -1
         var failedReads = 0
         var reads = 0
+        var lastPreviewUpdateMs = 0L
         while (isCurrentRaw(slot, connection, generation, mode)) {
             val count = connection.bulkTransfer(endpoint, transferBuffer, transferBuffer.size, 1500)
             if (reads++ < 8) android.util.Log.i(TAG, "KAMERA USB ${slot.index + 1}: bulk read=$count")
@@ -509,6 +535,14 @@ class MainActivity : AppCompatActivity() {
             if (flags and 0x02 != 0 && jpeg.size() > 4) {
                 val data = jpeg.toByteArray()
                 jpeg.reset()
+                slot.recordingWriter?.let { writer ->
+                    runCatching { writer.writeFrame(data) }.onFailure { error ->
+                        runOnUiThread { failRecording("Blad zapisu AVI: ${error.message ?: "plik"}") }
+                    }
+                }
+                val nowMs = android.os.SystemClock.elapsedRealtime()
+                if (slot.recordingWriter != null && nowMs - lastPreviewUpdateMs < 66L) continue
+                lastPreviewUpdateMs = nowMs
                 val bitmap = BitmapFactory.decodeByteArray(data, 0, data.size)
                 if (bitmap != null) {
                     slot.rawReconnects = 0
@@ -537,7 +571,6 @@ class MainActivity : AppCompatActivity() {
     ) {
         if (slot.libraryCamera?.getUsbDevice()?.deviceId == device.deviceId) return
         stopLibraryCamera(slot)
-        slot.raw = false
         slot.texture.visibility = View.VISIBLE
         slot.image.visibility = View.GONE
         setSlotStatus(slot, "Uruchamiam UVC przez libuvc…")
@@ -562,7 +595,9 @@ class MainActivity : AppCompatActivity() {
                         setSlotStatus(slot, "Kamera działa przez libuvc")
                     }
                     ICameraStateCallBack.State.CLOSED -> setSlotStatus(slot, "Strumień kamery zatrzymany")
-                    ICameraStateCallBack.State.ERROR -> setSlotStatus(slot, "Błąd kamery: ${msg ?: "libuvc"}")
+                    ICameraStateCallBack.State.ERROR -> {
+                        setSlotStatus(slot, "Błąd kamery: ${msg ?: "libuvc"}")
+                    }
                 }
             }
         })
@@ -656,6 +691,142 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun requestOrStartRecording() {
+        if (slots.any { it.device == null }) {
+            globalStatus.text = "Do nagrywania podlacz dwie kamery USB"
+            return
+        }
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), REQUEST_AUDIO_PERMISSION)
+            globalStatus.text = "Zezwol na dostep do audio USB"
+            return
+        }
+        startRecording()
+    }
+
+    private fun startRecording() {
+        if (recordingRequested) return
+        val directory = File(getExternalFilesDir(Environment.DIRECTORY_MOVIES), "Rajdex")
+        if (!directory.exists() && !directory.mkdirs()) {
+            globalStatus.text = "Nie mozna utworzyc katalogu nagran"
+            return
+        }
+        val audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
+        val audioInput = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS).firstOrNull {
+            it.type == AudioDeviceInfo.TYPE_USB_DEVICE && it.productName.toString().contains("UGREEN", true)
+        }
+        if (audioInput == null) {
+            globalStatus.text = "Nie wykryto wejscia audio USB grabbera UGREEN"
+            return
+        }
+        val stamp = java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US).format(java.util.Date())
+        try {
+            val audioFile = File(directory, "${stamp}_audio_UGREEN.wav")
+            audioRecorder = UsbWavRecorder.create(audioFile, audioInput).also { it.start() }
+            recordingRequested = true
+            recordingActive = true
+            recordingButton.text = "ZATRZYMAJ NAGRYWANIE"
+            recordingButton.isEnabled = true
+
+            slots.forEach { slot ->
+                val device = slot.device ?: error("Brak kamery USB ${slot.index + 1}")
+                val safeName = (device.productName ?: "USB_camera_${slot.index + 1}")
+                    .replace(Regex("[^A-Za-z0-9_-]"), "_")
+                if (slot.raw) {
+                    val mode = slot.selectedOption ?: error("Brak rozdzielczosci dla ${device.productName}")
+                    slot.recordingFile = File(directory, "${stamp}_${slot.index + 1}_${safeName}.avi")
+                    slot.recordingWriter = MjpegAviRecorder(
+                        slot.recordingFile!!,
+                        mode.width, mode.height, mode.fps.coerceAtLeast(1)
+                    )
+                    setSlotStatus(slot, "Nagrywam MJPEG ${mode.width}x${mode.height}")
+                } else {
+                    val camera = slot.libraryCamera ?: error("Kamera ${slot.index + 1} nie jest gotowa")
+                    val path = File(directory, "${stamp}_${slot.index + 1}_${safeName}").absolutePath
+                    camera.captureVideoStart(object : ICaptureCallBack {
+                        override fun onBegin() = setSlotStatus(slot, "Nagrywam MP4 H.264")
+                        override fun onError(error: String?) {
+                            setSlotStatus(slot, "Blad nagrywania: ${error ?: "encoder"}")
+                            runOnUiThread { failRecording("Blad zapisu MP4") }
+                        }
+                        override fun onComplete(path: String?) {
+                            path?.let { savedPath ->
+                                publishRecordingAsync(File(savedPath), "video/mp4") { published ->
+                                    setSlotStatus(slot, "Zapisano: DCIM/Rajdex/${File(savedPath).name}")
+                                }
+                            }
+                        }
+                    }, path)
+                }
+            }
+            globalStatus.text = "Nagrywanie obu kamer i audio USB"
+        } catch (error: Exception) {
+            failRecording("Nie mozna uruchomic nagrywania: ${error.message ?: error.javaClass.simpleName}")
+        }
+    }
+
+    private fun stopRecordingAndRestorePreview() {
+        if (!recordingRequested) return
+        recordingRequested = false
+        recordingActive = false
+        recordingButton.text = "NAGRAJ OBIE KAMERY"
+        slots.forEach { slot ->
+            slot.recordingWriter?.let { writer ->
+                slot.recordingWriter = null
+                val recordingFile = slot.recordingFile
+                slot.recordingFile = null
+                Thread({
+                    val saved = runCatching { writer.close() }.isSuccess
+                    if (saved) {
+                        if (recordingFile != null) {
+                            publishRecordingAsync(recordingFile, "video/x-msvideo") {
+                                setSlotStatus(slot, "Zapisano AVI: DCIM/Rajdex/${recordingFile.name}")
+                            }
+                        } else {
+                            runOnUiThread { setSlotStatus(slot, "Blad finalizacji AVI") }
+                        }
+                    } else {
+                        runOnUiThread { setSlotStatus(slot, "Blad finalizacji AVI") }
+                    }
+                }, "AVI-finalize").start()
+            }
+            slot.libraryCamera?.let { camera ->
+                if (camera.isRecording()) camera.captureVideoStop()
+            }
+        }
+        audioRecorder?.let { recorder ->
+            audioRecorder = null
+            Thread({
+                val file = runCatching { recorder.stop() }.getOrNull()
+                if (file != null) {
+                    publishRecordingAsync(file, "audio/wav") {
+                        runOnUiThread { globalStatus.text = "Nagrania zapisane w DCIM/Rajdex" }
+                    }
+                } else {
+                    runOnUiThread { globalStatus.text = "Blad finalizacji pliku WAV" }
+                }
+            }, "USB-audio-finalize").start()
+        }
+        updateGlobalStatus()
+    }
+
+    private fun failRecording(message: String) {
+        globalStatus.text = message
+        if (recordingRequested) stopRecordingAndRestorePreview()
+    }
+
+    private fun publishRecordingAsync(file: File, mimeType: String, onPublished: (android.net.Uri) -> Unit) {
+        Thread({
+            runCatching { RecordingPublisher.publish(contentResolver, file, mimeType) }
+                .onSuccess { uri -> runOnUiThread { onPublished(uri) } }
+                .onFailure { error ->
+                    runOnUiThread {
+                        globalStatus.text = "Blad przenoszenia nagrania: ${error.message ?: file.absolutePath}"
+                    }
+                }
+        }, "Recording-publisher").start()
+    }
+
     private fun setSlotStatus(slot: PreviewSlot, message: String) {
         if (::slots.isInitialized) runOnUiThread { slot.status.text = message }
     }
@@ -663,6 +834,9 @@ class MainActivity : AppCompatActivity() {
     private fun updateGlobalStatus() {
         if (!::globalStatus.isInitialized) return
         val count = slotByDeviceId.size
+        if (::recordingButton.isInitialized) {
+            recordingButton.isEnabled = recordingRequested || count == slots.size
+        }
         globalStatus.text = when (count) {
             0 -> "Podłącz jedną lub dwie kamery UVC przez USB"
             1 -> "1 kamera UVC połączona · druga może zostać podłączona"
@@ -756,7 +930,10 @@ class MainActivity : AppCompatActivity() {
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == REQUEST_CAMERA_PERMISSION && grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
+        if (requestCode == REQUEST_AUDIO_PERMISSION) {
+            if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) startRecording()
+            else globalStatus.text = "Uprawnienie do audio jest potrzebne do zapisu dzwieku USB"
+        } else if (requestCode == REQUEST_CAMERA_PERMISSION && grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
             startCameraClient()
         } else if (requestCode == REQUEST_CAMERA_PERMISSION) {
             globalStatus.text = "Uprawnienie Kamera jest potrzebne do dostępu UVC"
@@ -765,7 +942,13 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         runCatching { unregisterReceiver(rawPermissionReceiver) }
+        runCatching { audioRecorder?.stop() }
+        audioRecorder = null
         slots.forEach { slot ->
+            slot.recordingWriter?.let { runCatching { it.close() }; slot.recordingWriter = null }
+            slot.libraryCamera?.let { camera ->
+                if (camera.isRecording()) camera.captureVideoStop()
+            }
             stopRaw(slot)
             slot.rawWorker.shutdownNow()
             stopLibraryCamera(slot)
@@ -780,5 +963,6 @@ class MainActivity : AppCompatActivity() {
         private const val DEFAULT_WIDTH = 640
         private const val DEFAULT_HEIGHT = 480
         private const val REQUEST_CAMERA_PERMISSION = 40
+        private const val REQUEST_AUDIO_PERMISSION = 41
     }
 }

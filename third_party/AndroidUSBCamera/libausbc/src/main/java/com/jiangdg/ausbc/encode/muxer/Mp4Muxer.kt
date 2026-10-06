@@ -245,6 +245,12 @@ class Mp4Muxer(
             if (videoPath.isNullOrEmpty()) {
                 return
             }
+            val appFiles = ctx.getExternalFilesDir(null)?.canonicalPath
+            val outputPath = File(videoPath).canonicalPath
+            if (appFiles != null && outputPath.startsWith(appFiles + File.separator)) {
+                mMainHandler.post { mCaptureCallBack?.onComplete(videoPath) }
+                return
+            }
             ctx.contentResolver.let { content ->
                 val uri = MediaStore.Video.Media.EXTERNAL_CONTENT_URI
                 content.insert(uri, getVideoContentValues(videoPath))

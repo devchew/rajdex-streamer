@@ -1,7 +1,6 @@
 package com.jiangdg.ausbc
 
 import android.content.Context
-import android.content.res.Configuration
 import android.graphics.SurfaceTexture
 import android.hardware.usb.UsbDevice
 import android.os.*
@@ -445,11 +444,10 @@ class MultiCameraClient(ctx: Context, callback: IDeviceConnectCallBack?) {
                 mAudioProcess = processor
             }
             // create video process
-            mContext.resources.configuration.orientation.let { orientation ->
-                orientation == Configuration.ORIENTATION_PORTRAIT
-            }.also { isPortrait ->
-                mVideoProcess = H264EncodeProcessor(previewWidth, previewHeight, isNeedGLESRender, isPortrait)
-            }
+            // UVC frames already use the camera's landscape dimensions. Rotating the
+            // YUV buffer based on the tablet orientation corrupts its row layout and
+            // produces horizontal tearing in recorded H.264 frames.
+            mVideoProcess = H264EncodeProcessor(previewWidth, previewHeight, isNeedGLESRender, false)
         }
 
         /**
