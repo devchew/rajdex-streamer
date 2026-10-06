@@ -23,4 +23,6 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "Rajdex-streamer"
-include(":app")
+include(":app", ":ausbc", ":ausbc-uvc")
+project(":ausbc").projectDir = file("third_party/AndroidUSBCamera/libausbc")
+project(":ausbc-uvc").projectDir = file("third_party/AndroidUSBCamera/libuvc")

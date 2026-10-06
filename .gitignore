@@ -1,5 +1,8 @@
 *.iml
 .gradle
+.gradle-user
+.kotlin/
+.android-user/
 /local.properties
 /.idea/caches
 /.idea/libraries
@@ -8,9 +11,10 @@
 /.idea/navEditor.xml
 /.idea/assetWizardSettings.xml
 .DS_Store
-/build
+build/
+uvc-classes.jar
 /captures
 .externalNativeBuild
 .cxx
 local.properties
-.idea
+.idea/
