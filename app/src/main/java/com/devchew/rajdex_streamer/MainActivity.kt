@@ -90,7 +90,7 @@ class MainActivity : AppCompatActivity() {
         lateinit var recordingCheckbox: CheckBox
         lateinit var encodeMjpegCheckbox: CheckBox
         var recordingWriter: MjpegAviRecorder? = null
-        var mp4RecordingWriter: MjpegMp4Recorder? = null
+        var mp4RecordingWriter: MjpegMp4RecordingWorker? = null
         var recordingFile: File? = null
     }
 
@@ -435,7 +435,9 @@ class MainActivity : AppCompatActivity() {
             slot.rawInterface = streamInterface
             slot.rawEndpoint = endpoint
 
-            val modes = findMjpegModes(connection.rawDescriptors)
+            val descriptors = connection.rawDescriptors
+            logUvcFormats(device, descriptors)
+            val modes = findMjpegModes(descriptors)
             if (modes.isEmpty()) {
                 stopRaw(slot)
                 setSlotStatus(slot, "Brak trybów MJPEG w deskryptorze urządzenia")
@@ -579,6 +581,7 @@ class MainActivity : AppCompatActivity() {
             if (jpeg.size() > 8 * 1024 * 1024) jpeg.reset()
             if (flags and 0x02 != 0 && jpeg.size() > 4) {
                 val data = jpeg.toByteArray()
+                val capturedAtNs = System.nanoTime()
                 jpeg.reset()
                 slot.recordingWriter?.let { writer ->
                     runCatching { writer.writeFrame(data) }.onFailure { error ->
@@ -586,12 +589,10 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
                 slot.mp4RecordingWriter?.let { writer ->
-                    runCatching { writer.writeFrame(data) }.onFailure { error ->
-                        runOnUiThread { failRecording("Blad kodowania MP4: ${error.message ?: "encoder"}") }
-                    }
+                    writer.offerFrame(data, capturedAtNs)
                 }
                 val nowMs = android.os.SystemClock.elapsedRealtime()
-                if ((slot.recordingWriter != null || slot.mp4RecordingWriter != null) && nowMs - lastPreviewUpdateMs < 66L) continue
+                if ((slot.recordingWriter != null || slot.mp4RecordingWriter != null) && nowMs - lastPreviewUpdateMs < 33L) continue
                 lastPreviewUpdateMs = nowMs
                 val bitmap = BitmapFactory.decodeByteArray(data, 0, data.size)
                 if (bitmap != null) {
@@ -794,9 +795,11 @@ class MainActivity : AppCompatActivity() {
                     val mode = slot.selectedOption ?: error("Brak rozdzielczosci dla ${device.productName}")
                     if (slot.encodeMjpegCheckbox.isChecked) {
                         slot.recordingFile = File(directory, "${stamp}_${slot.index + 1}_${safeName}.mp4")
-                        slot.mp4RecordingWriter = MjpegMp4Recorder(
+                        slot.mp4RecordingWriter = MjpegMp4RecordingWorker(
                             slot.recordingFile!!, mode.width, mode.height, 30
-                        )
+                        ) { error ->
+                            runOnUiThread { failRecording("Blad kodowania MP4: ${error.message ?: "encoder"}") }
+                        }
                         setSlotStatus(slot, "Nagrywam MP4 H.264 ${mode.width}x${mode.height}")
                     } else {
                         slot.recordingFile = File(directory, "${stamp}_${slot.index + 1}_${safeName}.avi")
@@ -1003,6 +1006,36 @@ class MainActivity : AppCompatActivity() {
             offset += length
         }
         return modes.sortedWith(compareBy<MjpegMode> { it.width * it.height }.thenBy { it.width })
+    }
+
+    private fun logUvcFormats(device: UsbDevice, descriptors: ByteArray) {
+        var offset = 0
+        val formats = mutableListOf<String>()
+        while (offset + 2 <= descriptors.size) {
+            val length = descriptors[offset].toInt() and 0xff
+            val type = descriptors[offset + 1].toInt() and 0xff
+            if (length < 2 || offset + length > descriptors.size) break
+            if (type == 0x24 && length >= 4) {
+                val subtype = descriptors[offset + 2].toInt() and 0xff
+                when (subtype) {
+                    0x04 -> if (length >= 21) {
+                        val index = descriptors[offset + 3].toInt() and 0xff
+                        val fourcc = String(descriptors, offset + 5, 4, Charsets.US_ASCII)
+                        formats.add("uncompressed[$index]=$fourcc")
+                    }
+                    0x06 -> if (length >= 5) {
+                        formats.add("mjpeg[${descriptors[offset + 3].toInt() and 0xff}]")
+                    }
+                    0x10 -> if (length >= 21) {
+                        val index = descriptors[offset + 3].toInt() and 0xff
+                        val fourcc = String(descriptors, offset + 5, 4, Charsets.US_ASCII)
+                        formats.add("frame-based[$index]=$fourcc")
+                    }
+                }
+            }
+            offset += length
+        }
+        android.util.Log.i(TAG, "${device.productName}: UVC stream formats=${formats.ifEmpty { listOf("none found") }}")
     }
 
     private fun selectFrameInterval(data: ByteArray, offset: Int, length: Int): Int {
