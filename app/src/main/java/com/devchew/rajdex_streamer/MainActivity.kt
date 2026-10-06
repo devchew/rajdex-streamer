@@ -81,10 +81,12 @@ class MainActivity : AppCompatActivity() {
         var rawRunning: AtomicBoolean? = null
         var rawGeneration = 0
         var rawReconnects = 0
+        var rawFormatFallbackAttempted = false
         var rawWorker = Executors.newSingleThreadExecutor()
         var libraryCamera: CameraUVC? = null
         var libraryControlBlock: USBMonitor.UsbControlBlock? = null
         var options: List<ResolutionOption> = emptyList()
+        var rawModes: List<MjpegMode> = emptyList()
         var selectedOption: ResolutionOption? = null
         var changingOptions = false
         lateinit var recordingCheckbox: CheckBox
@@ -160,7 +162,10 @@ class MainActivity : AppCompatActivity() {
         audioRecordingCheckbox = CheckBox(this).apply {
             text = "Nagrywaj dźwięk USB"
             setTextColor(Color.WHITE)
-            isChecked = true
+            isChecked = deviceProfilePreferences().getBoolean("audio_enabled", true)
+            setOnCheckedChangeListener { _, checked ->
+                deviceProfilePreferences().edit().putBoolean("audio_enabled", checked).apply()
+            }
         }
         root.addView(audioRecordingCheckbox)
 
@@ -217,7 +222,10 @@ class MainActivity : AppCompatActivity() {
             text = "Nagrywaj tę kamerę"
             setTextColor(Color.WHITE)
             isChecked = true
-            setOnCheckedChangeListener { _, _ -> refreshRecordingControls() }
+            setOnCheckedChangeListener { _, checked ->
+                saveDeviceBoolean(slot.device, "record_video", checked)
+                refreshRecordingControls()
+            }
         }
         recordingOptions.addView(slot.recordingCheckbox)
         slot.encodeMjpegCheckbox = CheckBox(this).apply {
@@ -225,7 +233,10 @@ class MainActivity : AppCompatActivity() {
             setTextColor(Color.WHITE)
             isChecked = false
             visibility = View.GONE
-            setOnCheckedChangeListener { _, _ -> refreshRecordingControls() }
+            setOnCheckedChangeListener { _, checked ->
+                saveDeviceBoolean(slot.device, "encode_mjpeg", checked)
+                refreshRecordingControls()
+            }
         }
         recordingOptions.addView(slot.encodeMjpegCheckbox)
         card.addView(recordingOptions)
@@ -241,8 +252,11 @@ class MainActivity : AppCompatActivity() {
                     slot.selectedOption = option
                     if (slot.raw) {
                         slot.rawReconnects = 0
+                        slot.rawFormatFallbackAttempted = false
+                        option.rawMode?.let { saveSelectedRawMode(slot.device, it) }
                         slot.device?.let { startRaw(slot, it, option.rawMode) }
                     } else {
+                        saveLibraryResolution(slot.device, option.width, option.height)
                         slot.texture.setAspectRatio(option.width, option.height)
                         val device = slot.device
                         val ctrlBlock = slot.libraryControlBlock
@@ -302,10 +316,11 @@ class MainActivity : AppCompatActivity() {
                 slot.libraryControlBlock = ctrlBlock
                 if (hasBulkEndpoint(device)) return
                 val selected = slot.selectedOption
+                val savedResolution = readLibraryResolution(device)
                 openLibraryCamera(
                     slot, device, ctrlBlock,
-                    selected?.width ?: DEFAULT_WIDTH,
-                    selected?.height ?: DEFAULT_HEIGHT
+                    selected?.width ?: savedResolution?.first ?: DEFAULT_WIDTH,
+                    selected?.height ?: savedResolution?.second ?: DEFAULT_HEIGHT
                 )
             }
 
@@ -338,6 +353,14 @@ class MainActivity : AppCompatActivity() {
         slot.device = device
         slotByDeviceId[device.deviceId] = slot
         slot.raw = hasBulkEndpoint(device)
+        deviceProfilePreferences().edit()
+            .putInt("${deviceProfileKey(device)}_vendor_id", device.vendorId)
+            .putInt("${deviceProfileKey(device)}_product_id", device.productId)
+            .putString("${deviceProfileKey(device)}_product_name", device.productName)
+            .putBoolean("${deviceProfileKey(device)}_raw_uvc", slot.raw)
+            .apply()
+        slot.recordingCheckbox.isChecked = readDeviceBoolean(device, "record_video", true)
+        slot.encodeMjpegCheckbox.isChecked = readDeviceBoolean(device, "encode_mjpeg", false)
         slot.title.text = "KAMERA USB ${slot.index + 1}: ${device.productName ?: "UVC"}"
         refreshRecordingControls(slot)
         updateGlobalStatus()
@@ -376,6 +399,7 @@ class MainActivity : AppCompatActivity() {
         refreshRecordingControls(slot)
         slot.options = emptyList()
         slot.selectedOption = null
+        slot.rawFormatFallbackAttempted = false
         slot.resolution.adapter = null
         slot.resolution.isEnabled = false
         slot.image.setImageDrawable(null)
@@ -443,7 +467,22 @@ class MainActivity : AppCompatActivity() {
                 setSlotStatus(slot, "Brak trybów MJPEG w deskryptorze urządzenia")
                 return@execute
             }
+            slot.rawModes = modes
+            val savedModeKey = usbModePreferenceKey(device)
+            val savedSelectedMode = readSelectedRawMode(device, modes)
+            val legacyModeId = savedModeKey?.let {
+                val oldPreferences = getSharedPreferences("usb_camera_modes", MODE_PRIVATE)
+                oldPreferences.getString(it, null) ?: oldPreferences.getString(legacyUsbModePreferenceKey(device), null)
+            }
+            val savedWorkingMode = legacyModeId?.let { id ->
+                modes.firstOrNull { "${it.formatIndex}:${it.frameIndex}" == id }
+            }
             val mode = requestedMode?.let { requested -> modes.firstOrNull { it == requested } }
+                ?: savedSelectedMode
+                ?: savedWorkingMode
+                ?: (if (device.productName?.contains("UGREEN", ignoreCase = true) == true) {
+                    modes.firstOrNull { it.width == 1280 && it.height == 720 }
+                } else null)
                 ?: modes.firstOrNull { it.width == 640 && it.height == 480 }
                 ?: modes.minBy { it.width * it.height }
             slot.selectedOption = ResolutionOption(mode.width, mode.height, intervalToFps(mode.frameInterval), mode)
@@ -522,6 +561,30 @@ class MainActivity : AppCompatActivity() {
 
             val gotFrame = readRawFrames(slot, connection, endpoint, payloadSize, mode, generation)
             if (!gotFrame && isCurrentRaw(slot, connection, generation, mode)) {
+                val alternateFormatMode = if (!slot.rawFormatFallbackAttempted) {
+                    slot.rawModes
+                        .filter { it.formatIndex != mode.formatIndex }
+                        .minByOrNull { it.width.toLong() * it.height }
+                } else null
+                if (alternateFormatMode != null) {
+                    slot.rawFormatFallbackAttempted = true
+                    val option = ResolutionOption(
+                        alternateFormatMode.width,
+                        alternateFormatMode.height,
+                        intervalToFps(alternateFormatMode.frameInterval),
+                        alternateFormatMode
+                    )
+                    slot.selectedOption = option
+                    slot.rawReconnects = 0
+                    setSlotStatus(slot, "Brak klatek ${mode.width}×${mode.height} — próbuję ${option.width}×${option.height}")
+                    android.util.Log.w(TAG, "${device.productName}: no frames in MJPEG format ${mode.formatIndex}; trying format ${alternateFormatMode.formatIndex} ${option.width}x${option.height}")
+                    startRaw(slot, device, alternateFormatMode)
+                    return
+                }
+                if (!slot.rawFormatFallbackAttempted) {
+                    slot.rawFormatFallbackAttempted = true
+                    android.util.Log.w(TAG, "${device.productName}: no alternate MJPEG format for ${mode.width}x${mode.height}; modes=${slot.rawModes.map { "${it.formatIndex}:${it.frameIndex} ${it.width}x${it.height}" }}")
+                }
                 if (slot.rawReconnects < 4) {
                     slot.rawReconnects++
                     setSlotStatus(slot, "Brak klatek — ponawiam połączenie (${slot.rawReconnects}/4)…")
@@ -597,6 +660,16 @@ class MainActivity : AppCompatActivity() {
                 val bitmap = BitmapFactory.decodeByteArray(data, 0, data.size)
                 if (bitmap != null) {
                     slot.rawReconnects = 0
+                    slot.rawFormatFallbackAttempted = false
+                    val preferenceKey = usbModePreferenceKey(slot.device)
+                    if (preferenceKey != null) {
+                        val modeId = "${mode.formatIndex}:${mode.frameIndex}"
+                        val preferences = getSharedPreferences("usb_camera_modes", MODE_PRIVATE)
+                        if (preferences.getString(preferenceKey, null) != modeId) {
+                            preferences.edit().putString(preferenceKey, modeId).apply()
+                            android.util.Log.i(TAG, "${slot.device?.productName}: saved working MJPEG mode ${mode.width}x${mode.height} format=${mode.formatIndex} frame=${mode.frameIndex}")
+                        }
+                    }
                     runOnUiThread {
                         if (isCurrentRaw(slot, connection, generation, mode)) {
                             slot.image.setImageBitmap(bitmap)
@@ -612,6 +685,63 @@ class MainActivity : AppCompatActivity() {
     private fun isCurrentRaw(slot: PreviewSlot, connection: UsbDeviceConnection, generation: Int, mode: MjpegMode) =
         slot.rawGeneration == generation && slot.rawConnection === connection &&
             slot.rawRunning?.get() == true && slot.selectedOption?.rawMode == mode
+
+    private fun usbModePreferenceKey(device: UsbDevice?): String? = device?.let {
+        deviceProfileKey(it)
+    }
+
+    private fun legacyUsbModePreferenceKey(device: UsbDevice): String =
+        "${device.vendorId}_${device.productId}_${device.productName.orEmpty().hashCode()}"
+
+    private fun deviceProfileKey(device: UsbDevice): String {
+        val product = device.productName.orEmpty().lowercase()
+            .replace(Regex("[^a-z0-9]+"), "_").trim('_')
+        return "${device.vendorId}_${device.productId}_${product.ifEmpty { "usb_camera" }}"
+    }
+
+    private fun deviceProfilePreferences() = getSharedPreferences(DEVICE_PROFILES_PREFS, MODE_PRIVATE)
+
+    private fun saveDeviceBoolean(device: UsbDevice?, setting: String, value: Boolean) {
+        val key = device?.let(::deviceProfileKey) ?: return
+        deviceProfilePreferences().edit().putBoolean("${key}_$setting", value).apply()
+    }
+
+    private fun readDeviceBoolean(device: UsbDevice, setting: String, default: Boolean): Boolean =
+        deviceProfilePreferences().getBoolean("${deviceProfileKey(device)}_$setting", default)
+
+    private fun saveSelectedRawMode(device: UsbDevice?, mode: MjpegMode) {
+        val key = device?.let(::deviceProfileKey) ?: return
+        val profile = listOf(
+            mode.formatIndex, mode.frameIndex, mode.width, mode.height,
+            mode.frameInterval, mode.maxFrameSize
+        ).joinToString(",")
+        deviceProfilePreferences().edit().putString("${key}_raw_selected", profile).apply()
+    }
+
+    private fun readSelectedRawMode(device: UsbDevice, modes: List<MjpegMode>): MjpegMode? {
+        val profile = deviceProfilePreferences().getString("${deviceProfileKey(device)}_raw_selected", null)
+            ?: return null
+        val parts = profile.split(',').mapNotNull { it.toIntOrNull() }
+        if (parts.size < 2) return null
+        return modes.firstOrNull { it.formatIndex == parts[0] && it.frameIndex == parts[1] }
+            ?.takeIf { parts.size < 4 || (it.width == parts[2] && it.height == parts[3]) }
+    }
+
+    private fun saveLibraryResolution(device: UsbDevice?, width: Int, height: Int) {
+        val key = device?.let(::deviceProfileKey) ?: return
+        deviceProfilePreferences().edit()
+            .putInt("${key}_library_width", width)
+            .putInt("${key}_library_height", height)
+            .apply()
+    }
+
+    private fun readLibraryResolution(device: UsbDevice): Pair<Int, Int>? {
+        val preferences = deviceProfilePreferences()
+        val key = deviceProfileKey(device)
+        val width = preferences.getInt("${key}_library_width", 0)
+        val height = preferences.getInt("${key}_library_height", 0)
+        return if (width > 0 && height > 0) width to height else null
+    }
 
     private fun openLibraryCamera(
         slot: PreviewSlot,
@@ -636,11 +766,15 @@ class MainActivity : AppCompatActivity() {
                             .sortedWith(compareBy<PreviewSize> { it.width * it.height }.thenBy { it.width })
                         val options = sizes.map { ResolutionOption(it.width, it.height, 30) }
                         val current = self.getCameraRequest()
-                        val selected = options.firstOrNull {
+                        val savedResolution = readLibraryResolution(device)
+                        val selected = savedResolution?.let { (width, height) ->
+                            options.firstOrNull { it.width == width && it.height == height }
+                        } ?: options.firstOrNull {
                             it.width == current?.previewWidth && it.height == current.previewHeight
                         } ?: options.firstOrNull { it.width == 640 && it.height == 480 } ?: options.firstOrNull()
                         if (selected != null) {
                             slot.selectedOption = selected
+                            saveLibraryResolution(device, selected.width, selected.height)
                             updateOptions(slot, options, selected)
                         }
                         setSlotStatus(slot, "Kamera działa przez libuvc")
@@ -1099,6 +1233,7 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val TAG = "DualUvc"
+        private const val DEVICE_PROFILES_PREFS = "usb_device_profiles"
         private const val DEFAULT_WIDTH = 640
         private const val DEFAULT_HEIGHT = 480
         private const val REQUEST_CAMERA_PERMISSION = 40
