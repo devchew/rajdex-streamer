@@ -1,10 +1,12 @@
 package com.devchew.rajdex_streamer
 
+import android.Manifest
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.hardware.usb.UsbConstants
@@ -15,15 +17,28 @@ import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.Bundle
-import android.view.Gravity
+import android.view.TextureView
+import android.view.View
 import android.view.ViewGroup
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
+import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
+import com.jiangdg.ausbc.MultiCameraClient
+import com.jiangdg.ausbc.callback.ICameraStateCallBack
+import com.jiangdg.ausbc.callback.IDeviceConnectCallBack
+import com.jiangdg.ausbc.camera.CameraUVC
+import com.jiangdg.ausbc.camera.bean.CameraRequest
+import com.jiangdg.ausbc.camera.bean.PreviewSize
+import com.jiangdg.ausbc.widget.AspectRatioTextureView
+import com.jiangdg.usb.USBMonitor
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -32,287 +47,455 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 class MainActivity : AppCompatActivity() {
     private lateinit var usbManager: UsbManager
-    private lateinit var status: TextView
-    private lateinit var preview: ImageView
-    private lateinit var resolution: Spinner
-    private val worker = Executors.newSingleThreadExecutor()
-    private val running = AtomicBoolean(false)
-    private var connection: UsbDeviceConnection? = null
-    private var activeDevice: UsbDevice? = null
-    private var availableModes: List<MjpegMode> = emptyList()
-    private var selectedMode: MjpegMode? = null
-    private var updatingResolutionList = false
-    private var restartGeneration = 0
-    private var reconnectAttempts = 0
+    private lateinit var globalStatus: TextView
+    private lateinit var slots: List<PreviewSlot>
+    private var cameraClient: MultiCameraClient? = null
+    private val slotByDeviceId = mutableMapOf<Int, PreviewSlot>()
+    private val rawPermissionPending = mutableSetOf<Int>()
+    private val libraryPermissionPending = mutableSetOf<Int>()
+    private val rawPermissionAction by lazy { "$packageName.RAW_USB_PERMISSION" }
 
-    private val permissionAction by lazy { "$packageName.USB_PERMISSION" }
-    private val usbReceiver = object : BroadcastReceiver() {
+    private inner class PreviewSlot(val index: Int) {
+        lateinit var title: TextView
+        lateinit var status: TextView
+        lateinit var resolution: Spinner
+        lateinit var image: ImageView
+        lateinit var texture: AspectRatioTextureView
+        var device: UsbDevice? = null
+        var raw = false
+        var rawConnection: UsbDeviceConnection? = null
+        var rawInterface: UsbInterface? = null
+        var rawEndpoint: UsbEndpoint? = null
+        var rawRunning: AtomicBoolean? = null
+        var rawGeneration = 0
+        var rawReconnects = 0
+        var rawWorker = Executors.newSingleThreadExecutor()
+        var libraryCamera: CameraUVC? = null
+        var libraryControlBlock: USBMonitor.UsbControlBlock? = null
+        var options: List<ResolutionOption> = emptyList()
+        var selectedOption: ResolutionOption? = null
+        var changingOptions = false
+    }
+
+    private data class ResolutionOption(
+        val width: Int,
+        val height: Int,
+        val fps: Int,
+        val rawMode: MjpegMode? = null
+    ) {
+        override fun toString() = "$width×$height  ·  $fps fps"
+    }
+
+    private data class MjpegMode(
+        val formatIndex: Int,
+        val frameIndex: Int,
+        val width: Int,
+        val height: Int,
+        val frameInterval: Int,
+        val maxFrameSize: Int
+    )
+
+    private val rawPermissionReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
-            when (intent.action) {
-                permissionAction -> {
-                    val device = intent.usbDeviceExtra() ?: return
-                    if (intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)) openCamera(device)
-                    else showStatus("Brak zgody na dostęp do grabbera USB")
-                }
-                UsbManager.ACTION_USB_DEVICE_ATTACHED -> intent.usbDeviceExtra()?.let(::requestAccess)
-                UsbManager.ACTION_USB_DEVICE_DETACHED -> {
-                    val detached = intent.usbDeviceExtra()
-                    if (detached?.deviceId == activeDevice?.deviceId) closeCamera("Odłączono grabber USB")
-                }
+            if (intent.action != rawPermissionAction) return
+            val device = intent.usbDeviceExtra() ?: return
+            rawPermissionPending.remove(device.deviceId)
+            if (intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)) {
+                slotByDeviceId[device.deviceId]?.let { startRaw(it, device, it.selectedOption?.rawMode) }
+            } else {
+                slotByDeviceId[device.deviceId]?.let { setSlotStatus(it, "Brak zgody na dostęp USB") }
             }
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        supportActionBar?.hide()
         window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         window.statusBarColor = Color.rgb(12, 15, 20)
         usbManager = getSystemService(UsbManager::class.java)
+        slots = listOf(PreviewSlot(0), PreviewSlot(1))
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(12, 12, 12, 12)
+            setPadding(12, 8, 12, 8)
             setBackgroundColor(Color.rgb(12, 15, 20))
         }
+        ViewCompat.setOnApplyWindowInsetsListener(root) { view, insets ->
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            view.setPadding(dp(12), dp(8) + bars.top, dp(12), dp(8) + bars.bottom)
+            insets
+        }
         root.addView(TextView(this).apply {
-            text = "PODGLĄD GRABBERA USB"
+            text = "PODGLĄD KAMER USB"
             textSize = 20f
             setTextColor(Color.WHITE)
-            setPadding(4, 4, 4, 8)
+            setPadding(4, 4, 4, 4)
         })
-        resolution = Spinner(this)
-        root.addView(resolution, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
-        ))
-        resolution.isEnabled = false
-        resolution.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-            override fun onNothingSelected(parent: AdapterView<*>?) = Unit
-            override fun onItemSelected(parent: AdapterView<*>?, view: android.view.View?, position: Int, id: Long) {
-                android.util.Log.i("RawUvc", "resolution selected position=$position updating=$updatingResolutionList")
-                if (updatingResolutionList || position !in availableModes.indices) return
-                val mode = availableModes[position]
-                if (mode == selectedMode) return
-                selectedMode = mode
-                reconnectAttempts = 0
-                val device = activeDevice ?: return
-                showStatus("Zmieniam rozdzielczość na ${mode.width}×${mode.height}…")
-                preview.setImageDrawable(null)
-                running.set(false)
-                val generation = ++restartGeneration
-                worker.execute {
-                    if (generation != restartGeneration) return@execute
-                    closeCamera(null)
-                    if (generation == restartGeneration) openCamera(device)
-                }
-            }
-        }
-        status = TextView(this).apply {
-            text = "Szukam grabbera UVC…"
-            textSize = 14f
+        globalStatus = TextView(this).apply {
+            text = "Inicjalizuję kamery USB…"
+            textSize = 13f
             setTextColor(Color.LTGRAY)
-            setPadding(4, 4, 4, 8)
+            setPadding(4, 0, 4, 6)
         }
-        root.addView(status)
-        preview = ImageView(this).apply {
-            setBackgroundColor(Color.BLACK)
-            scaleType = ImageView.ScaleType.FIT_CENTER
-            adjustViewBounds = true
-        }
-        root.addView(preview, LinearLayout.LayoutParams(
+        root.addView(globalStatus)
+
+        val scroll = ScrollView(this)
+        val panelList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        slots.forEach { slot -> panelList.addView(createSlotView(slot)) }
+        scroll.addView(panelList)
+        root.addView(scroll, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
         ))
         setContentView(root)
 
-        val filter = IntentFilter().apply {
-            addAction(permissionAction)
-            addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
-            addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
-        }
-        if (Build.VERSION.SDK_INT >= 33) registerReceiver(usbReceiver, filter, RECEIVER_NOT_EXPORTED)
-        else @Suppress("DEPRECATION") registerReceiver(usbReceiver, filter)
+        val filter = IntentFilter(rawPermissionAction)
+        if (Build.VERSION.SDK_INT >= 33) registerReceiver(rawPermissionReceiver, filter, RECEIVER_NOT_EXPORTED)
+        else @Suppress("DEPRECATION") registerReceiver(rawPermissionReceiver, filter)
 
-        val camera = usbManager.deviceList.values.firstOrNull(::isUvcDevice)
-        if (camera == null) showStatus("Podłącz grabber UVC przez USB") else requestAccess(camera)
-    }
-
-    override fun onDestroy() {
-        unregisterReceiver(usbReceiver)
-        closeCamera(null)
-        worker.shutdownNow()
-        super.onDestroy()
-    }
-
-    private fun isUvcDevice(device: UsbDevice): Boolean =
-        (0 until device.interfaceCount).any {
-            val intf = device.getInterface(it)
-            intf.interfaceClass == UsbConstants.USB_CLASS_VIDEO &&
-                intf.interfaceSubclass == 2
-        }
-
-    private fun requestAccess(device: UsbDevice) {
-        if (!isUvcDevice(device)) return
-        if (usbManager.hasPermission(device)) openCamera(device)
-        else {
-            showStatus("Oczekuję na zgodę dostępu do ${device.productName ?: "kamery USB"}…")
-            val intent = PendingIntent.getBroadcast(
-                this, device.deviceId, Intent(permissionAction).setPackage(packageName),
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
-            )
-            usbManager.requestPermission(device, intent)
+        if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+            startCameraClient()
+        } else {
+            requestPermissions(arrayOf(Manifest.permission.CAMERA), REQUEST_CAMERA_PERMISSION)
+            globalStatus.text = "Zezwól na uprawnienie Kamera, aby uruchomić UVC"
         }
     }
 
-    @Synchronized
-    private fun openCamera(device: UsbDevice) {
-        if (activeDevice?.deviceId == device.deviceId && running.get()) return
-        closeCamera(null)
-        val usbConnection = usbManager.openDevice(device)
-        if (usbConnection == null) {
-            showStatus("Nie udało się otworzyć urządzenia USB")
-            return
+    private fun createSlotView(slot: PreviewSlot): View {
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(8, 6, 8, 8)
+            setBackgroundColor(Color.rgb(25, 30, 38))
         }
-        val streamInterface = (0 until device.interfaceCount)
-            .map { device.getInterface(it) }
-            .firstOrNull { it.interfaceClass == UsbConstants.USB_CLASS_VIDEO && it.interfaceSubclass == 2 }
-        val bulkIn = streamInterface?.let { intf ->
-            (0 until intf.endpointCount).map { intf.getEndpoint(it) }
-                .firstOrNull {
-                    it.type == UsbConstants.USB_ENDPOINT_XFER_BULK &&
-                        it.direction == UsbConstants.USB_DIR_IN
+        slot.title = TextView(this).apply {
+            text = "KAMERA USB ${slot.index + 1}"
+            textSize = 16f
+            setTextColor(Color.WHITE)
+            setPadding(2, 2, 2, 2)
+        }
+        card.addView(slot.title)
+
+        slot.resolution = Spinner(this).apply {
+            isEnabled = false
+            onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                override fun onNothingSelected(parent: AdapterView<*>?) = Unit
+                override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                    if (slot.changingOptions || position !in slot.options.indices) return
+                    val option = slot.options[position]
+                    if (option == slot.selectedOption) return
+                    slot.selectedOption = option
+                    if (slot.raw) {
+                        slot.rawReconnects = 0
+                        slot.device?.let { startRaw(slot, it, option.rawMode) }
+                    } else {
+                        slot.texture.setAspectRatio(option.width, option.height)
+                        val device = slot.device
+                        val ctrlBlock = slot.libraryControlBlock
+                        if (device != null && ctrlBlock != null) {
+                            restartLibraryCamera(slot, device, ctrlBlock, option.width, option.height)
+                        }
+                    }
                 }
+            }
         }
-        if (streamInterface == null || bulkIn == null || !usbConnection.claimInterface(streamInterface, true)) {
-            usbConnection.close()
-            showStatus("Grabber nie udostępnia wejściowego strumienia UVC bulk")
-            return
-        }
+        card.addView(slot.resolution)
 
-        val modes = findMjpegModes(usbConnection.rawDescriptors)
-        if (modes.isEmpty()) {
-            usbConnection.releaseInterface(streamInterface)
-            usbConnection.close()
-            showStatus("Nie znaleziono trybu MJPEG w deskryptorach grabbera")
+        slot.status = TextView(this).apply {
+            text = "Oczekuję na kamerę UVC…"
+            textSize = 12f
+            setTextColor(Color.LTGRAY)
+            setPadding(2, 2, 2, 5)
+        }
+        card.addView(slot.status)
+
+        val previewArea = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+        slot.image = ImageView(this).apply {
+            setBackgroundColor(Color.BLACK)
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            adjustViewBounds = true
+        }
+        slot.texture = AspectRatioTextureView(this).apply { visibility = View.GONE }
+        previewArea.addView(slot.image, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
+        ))
+        previewArea.addView(slot.texture, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
+        ))
+        card.addView(previewArea, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
+        ).apply { height = dp(230) })
+        return card
+    }
+
+    private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
+
+    private fun startCameraClient() {
+        if (cameraClient != null) return
+        val client = MultiCameraClient(this, object : IDeviceConnectCallBack {
+            override fun onAttachDev(device: UsbDevice?) {
+                device?.let(::handleAttach)
+            }
+
+            override fun onDetachDec(device: UsbDevice?) {
+                device?.let(::handleDetach)
+            }
+
+            override fun onConnectDev(device: UsbDevice?, ctrlBlock: USBMonitor.UsbControlBlock?) {
+                if (device == null || ctrlBlock == null) return
+                libraryPermissionPending.remove(device.deviceId)
+                val slot = slotByDeviceId[device.deviceId] ?: return
+                if (hasBulkEndpoint(device)) return
+                slot.libraryControlBlock = ctrlBlock
+                val selected = slot.selectedOption
+                openLibraryCamera(
+                    slot, device, ctrlBlock,
+                    selected?.width ?: DEFAULT_WIDTH,
+                    selected?.height ?: DEFAULT_HEIGHT
+                )
+            }
+
+            override fun onDisConnectDec(device: UsbDevice?, ctrlBlock: USBMonitor.UsbControlBlock?) {
+                device?.let { slotByDeviceId[it.deviceId]?.let { slot -> stopLibraryCamera(slot) } }
+            }
+
+            override fun onCancelDev(device: UsbDevice?) {
+                device?.let {
+                    libraryPermissionPending.remove(it.deviceId)
+                    slotByDeviceId[it.deviceId]?.let { slot -> setSlotStatus(slot, "Brak zgody na kamerę USB") }
+                }
+            }
+        })
+        cameraClient = client
+        client.openDebug(true)
+        client.register()
+        globalStatus.text = "Szukam kamer UVC…"
+        usbManager.deviceList.values.filter(::isUvcDevice).forEach(::handleAttach)
+    }
+
+    private fun handleAttach(device: UsbDevice) {
+        if (!isUvcDevice(device)) return
+        val slot = slotByDeviceId[device.deviceId] ?: slots.firstOrNull { it.device == null }
+        if (slot == null) {
+            globalStatus.text = "Podłączono więcej niż dwie kamery UVC; pomiń ${device.productName ?: device.deviceName}"
             return
         }
-        availableModes = modes
-        val mode = selectedMode?.let { selected -> modes.firstOrNull { it == selected } }
-            ?: modes.firstOrNull { it.width == 640 && it.height == 480 }
-            ?: modes.minBy { it.width * it.height }
-        selectedMode = mode
-        updateResolutionOptions(modes, mode)
-        connection = usbConnection
-        activeDevice = device
-        running.set(true)
-        showStatus("Konfiguruję UVC ${mode.width}×${mode.height}…")
-        worker.execute { configureAndRead(usbConnection, streamInterface, bulkIn, mode) }
+        if (slot.device?.deviceId == device.deviceId) return
+        slot.device = device
+        slotByDeviceId[device.deviceId] = slot
+        slot.raw = hasBulkEndpoint(device)
+        slot.title.text = "KAMERA USB ${slot.index + 1}: ${device.productName ?: "UVC"}"
+        updateGlobalStatus()
+        slot.texture.visibility = if (slot.raw) View.GONE else View.VISIBLE
+        slot.image.visibility = if (slot.raw) View.VISIBLE else View.GONE
+        setSlotStatus(slot, "Proszę o dostęp do urządzenia…")
+        if (slot.raw) {
+            requestRawPermission(device)
+        } else if (libraryPermissionPending.add(device.deviceId)) {
+            cameraClient?.requestPermission(device)
+        }
+    }
+
+    private fun handleDetach(device: UsbDevice) {
+        val slot = slotByDeviceId.remove(device.deviceId) ?: return
+        rawPermissionPending.remove(device.deviceId)
+        libraryPermissionPending.remove(device.deviceId)
+        stopRaw(slot)
+        stopLibraryCamera(slot)
+        slot.libraryControlBlock = null
+        slot.device = null
+        slot.raw = false
+        slot.options = emptyList()
+        slot.selectedOption = null
+        slot.resolution.adapter = null
+        slot.resolution.isEnabled = false
+        slot.image.setImageDrawable(null)
+        slot.texture.visibility = View.GONE
+        slot.image.visibility = View.VISIBLE
+        slot.title.text = "KAMERA USB ${slot.index + 1}"
+        setSlotStatus(slot, "Odłączono — oczekuję na kamerę UVC")
+        updateGlobalStatus()
+    }
+
+    private fun requestRawPermission(device: UsbDevice) {
+        if (usbManager.hasPermission(device)) {
+            slotByDeviceId[device.deviceId]?.let { startRaw(it, device, it.selectedOption?.rawMode) }
+            return
+        }
+        if (!rawPermissionPending.add(device.deviceId)) return
+        val pendingIntent = PendingIntent.getBroadcast(
+            this,
+            device.deviceId,
+            Intent(rawPermissionAction).setPackage(packageName),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
+        )
+        usbManager.requestPermission(device, pendingIntent)
+    }
+
+    private fun startRaw(slot: PreviewSlot, device: UsbDevice, requestedMode: MjpegMode?) {
+        val generation = ++slot.rawGeneration
+        slot.rawRunning?.set(false)
+        slot.rawConnection?.let { old ->
+            runCatching { slot.rawInterface?.let(old::releaseInterface) }
+            runCatching { old.close() }
+        }
+        slot.rawConnection = null
+        slot.rawRunning = null
+        slot.rawWorker.execute {
+            if (generation != slot.rawGeneration || slot.device?.deviceId != device.deviceId) return@execute
+            try {
+                // Let Android finish USB/audio enumeration before opening a bulk stream.
+                Thread.sleep(if (requestedMode == null) 1_200L else 400L)
+            } catch (_: InterruptedException) {
+                return@execute
+            }
+            if (generation != slot.rawGeneration || slot.device?.deviceId != device.deviceId) return@execute
+            val connection = usbManager.openDevice(device)
+            if (connection == null) {
+                setSlotStatus(slot, "Nie udało się otworzyć USB")
+                return@execute
+            }
+            val streamInterface = findBulkInterface(device)
+            val endpoint = streamInterface?.let(::findBulkInEndpoint)
+            if (streamInterface == null || endpoint == null || !connection.claimInterface(streamInterface, true)) {
+                connection.close()
+                setSlotStatus(slot, "Nie udało się uruchomić strumienia bulk")
+                return@execute
+            }
+            slot.rawConnection = connection
+            slot.rawInterface = streamInterface
+            slot.rawEndpoint = endpoint
+
+            val modes = findMjpegModes(connection.rawDescriptors)
+            if (modes.isEmpty()) {
+                stopRaw(slot)
+                setSlotStatus(slot, "Brak trybów MJPEG w deskryptorze urządzenia")
+                return@execute
+            }
+            val mode = requestedMode?.let { requested -> modes.firstOrNull { it == requested } }
+                ?: modes.firstOrNull { it.width == 640 && it.height == 480 }
+                ?: modes.minBy { it.width * it.height }
+            slot.selectedOption = ResolutionOption(mode.width, mode.height, intervalToFps(mode.frameInterval), mode)
+            slot.rawRunning = AtomicBoolean(true)
+            runOnUiThread {
+                slot.image.visibility = View.VISIBLE
+                slot.texture.visibility = View.GONE
+                slot.image.setImageDrawable(null)
+            }
+            updateOptions(slot, modes.map {
+                ResolutionOption(it.width, it.height, intervalToFps(it.frameInterval), it)
+            }, slot.selectedOption!!)
+            setSlotStatus(slot, "Konfiguruję ${mode.width}×${mode.height}…")
+            configureAndRead(slot, device, connection, streamInterface, endpoint, mode, generation)
+        }
     }
 
     private fun configureAndRead(
-        usbConnection: UsbDeviceConnection,
+        slot: PreviewSlot,
+        device: UsbDevice,
+        connection: UsbDeviceConnection,
         streamInterface: UsbInterface,
         endpoint: UsbEndpoint,
-        mode: MjpegMode
+        mode: MjpegMode,
+        generation: Int
     ) {
         try {
             val probe = ByteBuffer.allocate(26).order(ByteOrder.LITTLE_ENDIAN).apply {
-                putShort(1) // request the selected frame interval
+                putShort(1)
                 put(mode.formatIndex.toByte())
                 put(mode.frameIndex.toByte())
                 putInt(mode.frameInterval)
                 putShort(0); putShort(0); putShort(0); putShort(0); putShort(0)
                 putInt(mode.maxFrameSize)
-                putInt(0) // device selects the bulk payload size
+                putInt(0)
             }.array()
 
-            var probeSet = -1
+            var probeResult = -1
             for (attempt in 0 until 3) {
-                if (!running.get() || connection !== usbConnection || selectedMode != mode) return
-                val interfaceReady = usbConnection.setInterface(streamInterface)
-                android.util.Log.i("RawUvc", "setInterface(${streamInterface.id})=$interfaceReady attempt=${attempt + 1} mode=${mode.width}x${mode.height}")
+                if (!isCurrentRaw(slot, connection, generation, mode)) return
+                val interfaceReady = connection.setInterface(streamInterface)
+                android.util.Log.i(TAG, "${device.productName}: setInterface=$interfaceReady attempt=${attempt + 1} mode=${mode.width}x${mode.height}")
                 if (!interfaceReady) Thread.sleep(150L * (attempt + 1))
-                probeSet = usbConnection.controlTransfer(
+                val endpointReset = connection.controlTransfer(
+                    0x02, 0x01, 0, endpoint.address, ByteArray(0), 0, 1000
+                )
+                android.util.Log.i(TAG, "${device.productName}: clear endpoint halt=${endpointReset >= 0}")
+                probeResult = connection.controlTransfer(
                     0x21, 0x01, 0x0100, streamInterface.id, probe, probe.size, 1500
                 )
-                android.util.Log.i("RawUvc", "PROBE SET result=$probeSet attempt=${attempt + 1} intf=${streamInterface.id} frame=${mode.frameIndex}")
-                if (probeSet >= 0) break
+                android.util.Log.i(TAG, "${device.productName}: PROBE=$probeResult attempt=${attempt + 1} frame=${mode.frameIndex}")
+                if (probeResult >= 0) break
                 Thread.sleep(200L * (attempt + 1))
             }
-            check(probeSet >= 0) { "UVC PROBE SET nie powiódł się po 3 próbach" }
+            check(probeResult >= 0) { "UVC PROBE SET failed after three attempts" }
+
             val negotiated = ByteArray(26)
-            val actual = usbConnection.controlTransfer(
+            val probeLength = connection.controlTransfer(
                 0xA1, 0x81, 0x0100, streamInterface.id, negotiated, negotiated.size, 1500
             )
-            val negotiatedView = ByteBuffer.wrap(negotiated).order(ByteOrder.LITTLE_ENDIAN)
-            android.util.Log.i("RawUvc", "PROBE GET result=$actual format=${negotiated[2].toInt() and 0xff} frame=${negotiated[3].toInt() and 0xff} interval=${negotiatedView.getInt(4)} maxFrame=${negotiatedView.getInt(18)} payload=${negotiatedView.getInt(22)}")
-            if (actual >= 26) {
-                ByteBuffer.wrap(negotiated).order(ByteOrder.LITTLE_ENDIAN).apply {
-                    position(22)
-                    val payload = int
-                    if (payload > 0) Unit
-                }
-            } else {
-                System.arraycopy(probe, 0, negotiated, 0, probe.size)
-            }
+            if (probeLength < 26) System.arraycopy(probe, 0, negotiated, 0, probe.size)
             ByteBuffer.wrap(negotiated).order(ByteOrder.LITTLE_ENDIAN).putInt(22, endpoint.maxPacketSize)
-            android.util.Log.i("RawUvc", "requesting ${endpoint.maxPacketSize}B UVC payload")
-            val commitResult = usbConnection.controlTransfer(
+            check(connection.controlTransfer(
                 0x21, 0x01, 0x0200, streamInterface.id, negotiated, negotiated.size, 1500
-            )
-            android.util.Log.i("RawUvc", "COMMIT result=$commitResult")
-            check(commitResult >= 0) { "UVC COMMIT nie powiódł się" }
+            ) >= 0) { "UVC COMMIT failed" }
+
             val committed = ByteArray(26)
-            val committedLength = usbConnection.controlTransfer(
+            val committedLength = connection.controlTransfer(
                 0xA1, 0x81, 0x0200, streamInterface.id, committed, committed.size, 1500
             )
-            if (committedLength >= 26) {
-                System.arraycopy(committed, 0, negotiated, 0, negotiated.size)
-            }
+            if (committedLength >= 26) System.arraycopy(committed, 0, negotiated, 0, negotiated.size)
             val payloadSize = ByteBuffer.wrap(negotiated).order(ByteOrder.LITTLE_ENDIAN).getInt(22)
                 .coerceIn(512, 4 * 1024 * 1024)
-            android.util.Log.i("RawUvc", "COMMIT GET result=$committedLength payload=$payloadSize frame=${negotiated[3].toInt() and 0xff}")
-            runOnUiThread { showStatus("Odbieram MJPEG ${mode.width}×${mode.height}") }
-            val receivedFrame = readFrames(usbConnection, endpoint, payloadSize)
-            if (!receivedFrame && running.get() && selectedMode == mode) {
-                val device = activeDevice
-                if (device != null && reconnectAttempts < 2) {
-                    reconnectAttempts++
-                    android.util.Log.w("RawUvc", "no frame after USB mode change; reopening connection attempt=$reconnectAttempts mode=${mode.width}x${mode.height}")
-                    runOnUiThread { showStatus("Brak klatek — ponawiam połączenie USB (${reconnectAttempts}/2)…") }
-                    closeCamera(null)
-                    Thread.sleep(400)
-                    if (selectedMode == mode) openCamera(device)
+            android.util.Log.i(TAG, "${device.productName}: COMMIT frame=${negotiated[3].toInt() and 0xff} payload=$payloadSize")
+            setSlotStatus(slot, "Odbieram MJPEG ${mode.width}×${mode.height}")
+
+            val gotFrame = readRawFrames(slot, connection, endpoint, payloadSize, mode, generation)
+            if (!gotFrame && isCurrentRaw(slot, connection, generation, mode)) {
+                if (slot.rawReconnects < 4) {
+                    slot.rawReconnects++
+                    setSlotStatus(slot, "Brak klatek — ponawiam połączenie (${slot.rawReconnects}/4)…")
+                    android.util.Log.w(TAG, "${device.productName}: reopening USB after missing frames, attempt=${slot.rawReconnects}")
+                    startRaw(slot, device, mode)
                 } else {
-                    running.set(false)
-                    runOnUiThread { showStatus("Brak klatek z grabbera po ponowieniu połączenia") }
+                    stopRaw(slot)
+                    setSlotStatus(slot, "Brak obrazu USB po ponowieniu połączenia")
                 }
             }
         } catch (error: Exception) {
-            if (running.get() && connection === usbConnection && selectedMode == mode) runOnUiThread {
-                showStatus("Błąd UVC: ${error.message ?: error.javaClass.simpleName}")
+            if (isCurrentRaw(slot, connection, generation, mode)) {
+                android.util.Log.e(TAG, "${device.productName}: stream configuration failed", error)
+                slot.rawRunning?.set(false)
+                setSlotStatus(slot, "Błąd UVC: ${error.message ?: error.javaClass.simpleName}")
             }
         }
     }
 
-    private fun readFrames(usbConnection: UsbDeviceConnection, endpoint: UsbEndpoint, payloadSize: Int): Boolean {
+    private fun readRawFrames(
+        slot: PreviewSlot,
+        connection: UsbDeviceConnection,
+        endpoint: UsbEndpoint,
+        payloadSize: Int,
+        mode: MjpegMode,
+        generation: Int
+    ): Boolean {
         val transferBuffer = ByteArray(payloadSize)
         val jpeg = ByteArrayOutputStream(512 * 1024)
         var frameId = -1
-        var reads = 0
         var failedReads = 0
-        while (running.get()) {
-            val count = usbConnection.bulkTransfer(endpoint, transferBuffer, transferBuffer.size, 1500)
-            if (reads++ < 10) android.util.Log.i("RawUvc", "bulk read count=$count")
+        var reads = 0
+        while (isCurrentRaw(slot, connection, generation, mode)) {
+            val count = connection.bulkTransfer(endpoint, transferBuffer, transferBuffer.size, 1500)
+            if (reads++ < 8) android.util.Log.i(TAG, "KAMERA USB ${slot.index + 1}: bulk read=$count")
             if (count <= 0) {
-                if (++failedReads == 10) runOnUiThread {
-                    if (running.get()) showStatus("Brak danych z grabbera (błąd odczytu endpointu USB)")
-                }
+                failedReads++
+                if (failedReads == 10) setSlotStatus(slot, "Brak danych z grabbera USB")
                 if (failedReads >= 100) return false
                 try { Thread.sleep(20) } catch (_: InterruptedException) { return false }
                 continue
             }
             failedReads = 0
+            if (count < 2) continue
             val headerLength = transferBuffer[0].toInt() and 0xff
-            if (count < 2 || headerLength < 2 || headerLength > count) continue
+            if (headerLength < 2 || headerLength > count) continue
             val flags = transferBuffer[1].toInt() and 0xff
             if (flags and 0x40 != 0) {
                 jpeg.reset()
@@ -324,38 +507,188 @@ class MainActivity : AppCompatActivity() {
             if (count > headerLength) jpeg.write(transferBuffer, headerLength, count - headerLength)
             if (jpeg.size() > 8 * 1024 * 1024) jpeg.reset()
             if (flags and 0x02 != 0 && jpeg.size() > 4) {
-                val bytes = jpeg.toByteArray()
+                val data = jpeg.toByteArray()
                 jpeg.reset()
-                val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                if (bitmap != null) runOnUiThread {
-                    if (running.get()) {
-                        reconnectAttempts = 0
-                        preview.setImageBitmap(bitmap)
-                        status.text = "Obraz USB ${bitmap.width}×${bitmap.height}"
-                    } else bitmap.recycle()
+                val bitmap = BitmapFactory.decodeByteArray(data, 0, data.size)
+                if (bitmap != null) {
+                    slot.rawReconnects = 0
+                    runOnUiThread {
+                        if (isCurrentRaw(slot, connection, generation, mode)) {
+                            slot.image.setImageBitmap(bitmap)
+                            slot.status.text = "Obraz USB ${bitmap.width}×${bitmap.height}"
+                        } else bitmap.recycle()
+                    }
                 }
             }
         }
         return false
     }
 
-    private fun updateResolutionOptions(modes: List<MjpegMode>, selected: MjpegMode) {
+    private fun isCurrentRaw(slot: PreviewSlot, connection: UsbDeviceConnection, generation: Int, mode: MjpegMode) =
+        slot.rawGeneration == generation && slot.rawConnection === connection &&
+            slot.rawRunning?.get() == true && slot.selectedOption?.rawMode == mode
+
+    private fun openLibraryCamera(
+        slot: PreviewSlot,
+        device: UsbDevice,
+        ctrlBlock: USBMonitor.UsbControlBlock,
+        width: Int = DEFAULT_WIDTH,
+        height: Int = DEFAULT_HEIGHT
+    ) {
+        if (slot.libraryCamera?.getUsbDevice()?.deviceId == device.deviceId) return
+        stopLibraryCamera(slot)
+        slot.raw = false
+        slot.texture.visibility = View.VISIBLE
+        slot.image.visibility = View.GONE
+        setSlotStatus(slot, "Uruchamiam UVC przez libuvc…")
+        val camera = CameraUVC(this, device)
+        slot.libraryCamera = camera
+        camera.setUsbControlBlock(ctrlBlock)
+        camera.setCameraStateCallBack(object : ICameraStateCallBack {
+            override fun onCameraState(self: MultiCameraClient.ICamera, code: ICameraStateCallBack.State, msg: String?) {
+                when (code) {
+                    ICameraStateCallBack.State.OPENED -> {
+                        val sizes = self.getAllPreviewSizes().distinctBy { "${it.width}x${it.height}" }
+                            .sortedWith(compareBy<PreviewSize> { it.width * it.height }.thenBy { it.width })
+                        val options = sizes.map { ResolutionOption(it.width, it.height, 30) }
+                        val current = self.getCameraRequest()
+                        val selected = options.firstOrNull {
+                            it.width == current?.previewWidth && it.height == current.previewHeight
+                        } ?: options.firstOrNull { it.width == 640 && it.height == 480 } ?: options.firstOrNull()
+                        if (selected != null) {
+                            slot.selectedOption = selected
+                            updateOptions(slot, options, selected)
+                        }
+                        setSlotStatus(slot, "Kamera działa przez libuvc")
+                    }
+                    ICameraStateCallBack.State.CLOSED -> setSlotStatus(slot, "Strumień kamery zatrzymany")
+                    ICameraStateCallBack.State.ERROR -> setSlotStatus(slot, "Błąd kamery: ${msg ?: "libuvc"}")
+                }
+            }
+        })
+        slot.texture.setAspectRatio(width, height)
+        val request = CameraRequest.Builder()
+            .setPreviewWidth(width)
+            .setPreviewHeight(height)
+            .setRenderMode(CameraRequest.RenderMode.NORMAL)
+            .setAspectRatioShow(true)
+            .setAudioSource(CameraRequest.AudioSource.NONE)
+            .create()
+        var previewStarted = false
+        fun startPreviewWhenReady() {
+            if (previewStarted || slot.libraryCamera !== camera || !slot.texture.isAvailable) return
+            previewStarted = true
+            camera.openCamera(slot.texture, request)
+        }
+        slot.texture.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+            override fun onSurfaceTextureAvailable(surface: android.graphics.SurfaceTexture, width: Int, height: Int) {
+                startPreviewWhenReady()
+            }
+
+            override fun onSurfaceTextureSizeChanged(surface: android.graphics.SurfaceTexture, width: Int, height: Int) {
+                camera.setRenderSize(width, height)
+            }
+
+            override fun onSurfaceTextureDestroyed(surface: android.graphics.SurfaceTexture): Boolean {
+                if (slot.libraryCamera === camera) camera.closeCamera()
+                return true
+            }
+
+            override fun onSurfaceTextureUpdated(surface: android.graphics.SurfaceTexture) = Unit
+        }
+        slot.texture.post { startPreviewWhenReady() }
+    }
+
+    private fun restartLibraryCamera(
+        slot: PreviewSlot,
+        device: UsbDevice,
+        ctrlBlock: USBMonitor.UsbControlBlock,
+        width: Int,
+        height: Int
+    ) {
+        slot.libraryCamera?.let { oldCamera ->
+            oldCamera.setCameraStateCallBack(null)
+            runCatching { oldCamera.closeCamera() }
+        }
+        slot.libraryCamera = null
+        slot.libraryControlBlock = ctrlBlock
+        slot.texture.postDelayed({
+            if (slot.device?.deviceId == device.deviceId && slot.libraryControlBlock === ctrlBlock) {
+                openLibraryCamera(slot, device, ctrlBlock, width, height)
+            }
+        }, 500)
+    }
+
+    private fun stopLibraryCamera(slot: PreviewSlot) {
+        slot.libraryCamera?.let { camera ->
+            camera.setCameraStateCallBack(null)
+            runCatching { camera.closeCamera() }
+            runCatching { camera.setUsbControlBlock(null) }
+        }
+        slot.libraryCamera = null
+    }
+
+    private fun stopRaw(slot: PreviewSlot) {
+        slot.rawGeneration++
+        slot.rawRunning?.set(false)
+        slot.rawConnection?.let { connection ->
+            runCatching { slot.rawInterface?.let(connection::releaseInterface) }
+            runCatching { connection.close() }
+        }
+        slot.rawConnection = null
+        slot.rawInterface = null
+        slot.rawEndpoint = null
+        slot.rawRunning = null
+    }
+
+    private fun updateOptions(slot: PreviewSlot, options: List<ResolutionOption>, selected: ResolutionOption) {
         runOnUiThread {
-            updatingResolutionList = true
-            availableModes = modes
-            resolution.adapter = ArrayAdapter(
+            slot.changingOptions = true
+            slot.options = options
+            slot.resolution.adapter = ArrayAdapter(
                 this,
                 android.R.layout.simple_spinner_item,
-                modes.map { "${it.width}×${it.height}  ·  ${intervalToFps(it.frameInterval)} fps" }
+                options
             ).also { it.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item) }
-            resolution.setSelection(modes.indexOf(selected), false)
-            resolution.isEnabled = true
-            resolution.post { updatingResolutionList = false }
+            slot.resolution.setSelection(options.indexOf(selected), false)
+            slot.resolution.isEnabled = options.isNotEmpty()
+            slot.resolution.post { slot.changingOptions = false }
         }
     }
 
-    private fun intervalToFps(interval: Int): Int =
-        if (interval > 0) (10_000_000L / interval).toInt() else 30
+    private fun setSlotStatus(slot: PreviewSlot, message: String) {
+        if (::slots.isInitialized) runOnUiThread { slot.status.text = message }
+    }
+
+    private fun updateGlobalStatus() {
+        if (!::globalStatus.isInitialized) return
+        val count = slotByDeviceId.size
+        globalStatus.text = when (count) {
+            0 -> "Podłącz jedną lub dwie kamery UVC przez USB"
+            1 -> "1 kamera UVC połączona · druga może zostać podłączona"
+            else -> "Obie kamery UVC są połączone"
+        }
+    }
+
+    private fun isUvcDevice(device: UsbDevice): Boolean =
+        (0 until device.interfaceCount).any {
+            val intf = device.getInterface(it)
+            intf.interfaceClass == UsbConstants.USB_CLASS_VIDEO && intf.interfaceSubclass == 2
+        }
+
+    private fun hasBulkEndpoint(device: UsbDevice): Boolean = findBulkInterface(device) != null
+
+    private fun findBulkInterface(device: UsbDevice): UsbInterface? =
+        (0 until device.interfaceCount).map { device.getInterface(it) }
+            .firstOrNull { intf ->
+                intf.interfaceClass == UsbConstants.USB_CLASS_VIDEO && intf.interfaceSubclass == 2 &&
+                    findBulkInEndpoint(intf) != null
+            }
+
+    private fun findBulkInEndpoint(intf: UsbInterface): UsbEndpoint? =
+        (0 until intf.endpointCount).map { intf.getEndpoint(it) }.firstOrNull {
+            it.type == UsbConstants.USB_ENDPOINT_XFER_BULK && it.direction == UsbConstants.USB_DIR_IN
+        }
 
     private fun findMjpegModes(descriptors: ByteArray): List<MjpegMode> {
         var offset = 0
@@ -378,10 +711,10 @@ class MainActivity : AppCompatActivity() {
                         val width = u16(descriptors, offset + 5)
                         val height = u16(descriptors, offset + 7)
                         val maxFrameSize = u32(descriptors, offset + 17)
-                        val defaultInterval = selectFrameInterval(descriptors, offset, length)
+                        val interval = selectFrameInterval(descriptors, offset, length)
                         val mode = MjpegMode(
                             formatIndex, frameIndex, width, height,
-                            defaultInterval.takeIf { it > 0 } ?: 333333,
+                            interval.takeIf { it > 0 } ?: 333333,
                             maxFrameSize.takeIf { it > 0 } ?: width * height * 2
                         )
                         if (width > 0 && height > 0 && mode !in modes) modes.add(mode)
@@ -393,35 +726,6 @@ class MainActivity : AppCompatActivity() {
         return modes.sortedWith(compareBy<MjpegMode> { it.width * it.height }.thenBy { it.width })
     }
 
-    @Synchronized
-    private fun closeCamera(message: String?) {
-        running.set(false)
-        val oldConnection = connection
-        val oldDevice = activeDevice
-        connection = null
-        activeDevice = null
-        if (oldConnection != null) {
-            val intf = oldDevice?.let { device ->
-                (0 until device.interfaceCount).map { device.getInterface(it) }
-                    .firstOrNull { it.interfaceClass == UsbConstants.USB_CLASS_VIDEO && it.interfaceSubclass == 2 }
-            }
-            if (intf != null) runCatching { oldConnection.releaseInterface(intf) }
-            runCatching { oldConnection.close() }
-        }
-        if (message != null) showStatus(message)
-    }
-
-    private fun showStatus(message: String) {
-        if (::status.isInitialized) runOnUiThread { status.text = message }
-    }
-
-    private fun Intent.usbDeviceExtra(): UsbDevice? =
-        if (Build.VERSION.SDK_INT >= 33) getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
-        else @Suppress("DEPRECATION") getParcelableExtra(UsbManager.EXTRA_DEVICE)
-
-    private fun u16(data: ByteArray, offset: Int): Int =
-        (data[offset].toInt() and 0xff) or ((data[offset + 1].toInt() and 0xff) shl 8)
-
     private fun selectFrameInterval(data: ByteArray, offset: Int, length: Int): Int {
         val defaultInterval = u32(data, offset + 21)
         val intervalCount = data[offset + 25].toInt() and 0xff
@@ -430,11 +734,15 @@ class MainActivity : AppCompatActivity() {
                 val valueOffset = offset + 26 + index * 4
                 if (valueOffset + 4 <= offset + length) u32(data, valueOffset) else null
             }.filter { it > 0 }
-            return intervals.filter { it >= 333333 }.minOrNull()
-                ?: intervals.minOrNull() ?: defaultInterval
+            return intervals.filter { it >= 333333 }.minOrNull() ?: intervals.minOrNull() ?: defaultInterval
         }
         return if (defaultInterval > 0) maxOf(defaultInterval, 333333) else 333333
     }
+
+    private fun intervalToFps(interval: Int): Int = if (interval > 0) (10_000_000L / interval).toInt() else 30
+
+    private fun u16(data: ByteArray, offset: Int): Int =
+        (data[offset].toInt() and 0xff) or ((data[offset + 1].toInt() and 0xff) shl 8)
 
     private fun u32(data: ByteArray, offset: Int): Int =
         (data[offset].toInt() and 0xff) or
@@ -442,12 +750,35 @@ class MainActivity : AppCompatActivity() {
             ((data[offset + 2].toInt() and 0xff) shl 16) or
             ((data[offset + 3].toInt() and 0xff) shl 24)
 
-    private data class MjpegMode(
-        val formatIndex: Int,
-        val frameIndex: Int,
-        val width: Int,
-        val height: Int,
-        val frameInterval: Int,
-        val maxFrameSize: Int
-    )
+    private fun Intent.usbDeviceExtra(): UsbDevice? =
+        if (Build.VERSION.SDK_INT >= 33) getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
+        else @Suppress("DEPRECATION") getParcelableExtra(UsbManager.EXTRA_DEVICE)
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQUEST_CAMERA_PERMISSION && grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
+            startCameraClient()
+        } else if (requestCode == REQUEST_CAMERA_PERMISSION) {
+            globalStatus.text = "Uprawnienie Kamera jest potrzebne do dostępu UVC"
+        }
+    }
+
+    override fun onDestroy() {
+        runCatching { unregisterReceiver(rawPermissionReceiver) }
+        slots.forEach { slot ->
+            stopRaw(slot)
+            slot.rawWorker.shutdownNow()
+            stopLibraryCamera(slot)
+        }
+        cameraClient?.destroy()
+        cameraClient = null
+        super.onDestroy()
+    }
+
+    companion object {
+        private const val TAG = "DualUvc"
+        private const val DEFAULT_WIDTH = 640
+        private const val DEFAULT_HEIGHT = 480
+        private const val REQUEST_CAMERA_PERMISSION = 40
+    }
 }

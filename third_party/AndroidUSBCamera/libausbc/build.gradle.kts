@@ -11,7 +11,7 @@ android {
 }
 
 dependencies {
-    implementation(project(":ausbc-uvc"))
+    api(project(":ausbc-uvc"))
     compileOnly(files("libs/libnative-3.3.3-classes.jar", "libs/libutils-3.3.3-classes.jar"))
     implementation("androidx.appcompat:appcompat:1.6.1")
     implementation("androidx.fragment:fragment-ktx:1.6.2")
